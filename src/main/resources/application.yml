@@ -1,0 +1,63 @@
+spring:
+  application:
+    name: assistant
+  datasource:
+    driver-class-name: org.postgresql.Driver
+    url: jdbc:postgresql://localhost:5432/interview_jinyan?currentSchema=jinyan
+    username: postgres
+    password: 123456
+
+    # Hikari 连接池优化配置（可选）
+    hikari:
+      minimum-idle: 5
+      maximum-pool-size: 15
+      idle-timeout: 30000
+      max-lifetime: 1800000
+      connection-timeout: 30000
+
+  data:
+    redis:
+      url: redis://127.0.0.1:6379
+
+  jpa:
+    database-platform: org.hibernate.dialect.PostgreSQLDialect
+    hibernate:
+      ddl-auto: none # 自动同步实体类到数据库表结构（开发环境推荐，生产环境建议用 none）
+    show-sql: true     # 在控制台打印生成的 SQL 语句
+
+server:
+  port: 8080
+  servlet:
+    context-path: /assistant
+
+langchain:
+  deep-seek:
+    apiKey: sk-1361c727d8974364865d0d5eb144884f
+    baseUrl: https://api.deepseek.com
+    modelName: deepseek-v4-pro
+    maxTokens: 100000
+logging:
+  charset:
+    console: UTF-8
+    file: UTF-8
+
+# 2. LangChain4j 官方自动配置节点
+langchain4j:
+  # 配置 Ollama Embedding 模型
+  ollama:
+    embedding-model:
+      base-url: http://localhost:11434 # 本地 Ollama 地址
+      model-name: qwen3-embedding:4b   # 模型名称
+      timeout: 60s
+  rag:
+
+assistant:
+  rag:
+    ingestion:
+      stream-key: rag:segment:stream
+      dead-letter-stream-key: rag:segment:dead-letter
+      consumer-group: rag-summary-workers
+      llm-lock-key: rag:summary:llm-lock
+      max-retries: 3
+      read-timeout: 2s
+      pending-idle-timeout: 60s
