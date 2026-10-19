@@ -1,0 +1,990 @@
+Assistant 项目技术架构与原理说明
+版本：基于 2026-09-06 工作区代码
+项目路径：/Users/weijz/IdeaProjects/assistant
+
+======================================================================
+一 文档目的
+======================================================================
+
+本文档归纳 Assistant 项目当前使用的技术、核心原理、采用原因、主要调用链、
+部署依赖和已知风险。内容以当前代码为准，并明确区分：
+
+1. 当前已经实现的能力。
+2. 当前设计背后的原因和取舍。
+3. 尚未实现但建议后续补充的能力。
+
+项目当前的核心定位是一个基于 Spring Boot 和 LangChain4j 的 AI 助手及 RAG
+知识库服务。系统支持普通对话、流式对话、Agent Tool 调用、文档原文保存、
+文档切片、AI 摘要、异步向量化、pgvector 相似度检索，以及 Redis Stream
+任务状态跟踪。
+
+当前系统没有实现 MCP Server 或 MCP Client。MCP 只属于后续可扩展方向。
+
+
+======================================================================
+二 系统总体架构
+======================================================================
+
+                         用户或前端
+                             |
+                             v
+                    Spring MVC Controller
+                       /assistant/...
+                             |
+          +------------------+------------------+
+          |                  |                  |
+          v                  v                  v
+    DeepSeekService     VectorService       FileService
+    普通和流式对话       RAG 入库与检索       原文持久化
+          |                  |                  |
+          v                  v                  v
+    DeepSeek API       Redis Stream       PostgreSQL JPA
+                         异步队列          tb_file_info
+                             |
+                             v
+                   RagSegmentStreamConsumer
+                             |
+              +--------------+--------------+
+              |                             |
+              v                             v
+       DeepSeek 摘要模型              Ollama Embedding
+       Redis 全局并发锁               qwen3-embedding:4b
+              |                             |
+              +--------------+--------------+
+                             |
+                             v
+                    PostgreSQL pgvector
+                 knowledge_vector_store
+
+架构采用“同步接收和解析，异步摘要和向量化”的方式。上传请求只执行文件解析、
+原文保存、文档切片和 Redis 投递，耗时且容易受模型限流影响的摘要和向量化由
+后台消费者处理。
+
+
+======================================================================
+三 技术栈总览
+======================================================================
+
+技术                         当前用途                         采用原因
+----------------------------------------------------------------------
+Java 17                      主要开发语言                     长期支持版本，生态成熟
+Spring Boot 3.5.13           应用容器和自动配置               快速组合 Web、JPA、配置管理
+Spring MVC                   REST API                         与 Spring Boot 集成直接
+SseEmitter                   流式输出                         服务端可以逐段推送模型响应
+LangChain4j 1.19.0 beta29    LLM、Embedding、RAG、Agent       统一 Java AI 抽象
+OpenAI 兼容模型客户端         调用 DeepSeek                    DeepSeek 提供兼容接口
+Ollama                       本地运行 Embedding 模型           向量化数据不必发送到外部
+qwen3-embedding:4b           文本向量模型                     适合中文语义向量化
+PostgreSQL                   业务数据和向量数据               一个数据库覆盖结构化和向量数据
+pgvector                     相似度检索                       PostgreSQL 原生扩展，运维简单
+Spring Data JPA              文件原文持久化                   Repository 和事务模型清晰
+HikariCP                     JDBC 连接池                      Spring Boot 默认高性能连接池
+Redis Stream                 RAG 异步任务队列                 支持消费组、Pending 和 ACK
+Redisson 3.16.2              Redis Java 客户端和分布式锁       API 层次较高，支持 Stream 和锁
+PDFBox Parser                PDF 文本解析                     LangChain4j 已提供适配器
+Maven Wrapper                构建和依赖管理                   统一 Maven 版本和构建入口
+JUnit 5 与 AssertJ           单元测试                         Spring Boot Test 默认测试栈
+Lombok                       减少实体样板代码                 当前 FileInfo 使用 Getter
+
+
+======================================================================
+四 代码模块与职责
+======================================================================
+
+1. config
+
+AgentConfiguration
+  创建 OpenAiChatModel Bean 和窗口式 ChatMemory。
+  ChatMemory 最多保留 10 条消息，用于 Agent 多轮上下文。
+
+DeepSeekConfig
+  从 langchain.deep-seek 读取 API Key、Base URL、模型名称和最大 Token 数。
+  当前实现使用 static 字段，不是推荐的 Spring 配置方式，后文列为改进项。
+
+PgVectorStoreConfig
+  创建两个独立的 PgVectorEmbeddingStore Bean：
+  - knowledgeEmbeddingStore 对应 jinyan.knowledge_vector_store
+  - userEmbeddingStore 对应 jinyan.user_vector_store
+  两个 Bean 复用 Spring DataSource 和 HikariCP 连接池。
+
+RagIngestionProperties
+  管理 Redis Stream、消费组、死信、重试次数和 Pending 超时等配置。
+
+RedissonConfig
+  根据 spring.data.redis.url 创建 RedissonClient。
+
+2. controller
+
+DeepSeekController
+  提供普通对话、SSE 流式对话和 Agent 对话接口。
+
+PgVectorController
+  提供文本入库、文档上传、本地文件解析、向量检索和入库状态查询接口。
+
+FileController
+  根据 fileId 查询数据库中的完整文件原文。
+
+3. service
+
+DeepSeekServiceImpl
+  创建同步和流式 DeepSeek 客户端，负责直接调用模型。
+
+VectorServiceImpl
+  负责文件解析、原文保存、切片投递和向量检索。
+
+FileServiceImpl
+  使用 JPA 保存和查询 FileInfo，提供事务边界和基本参数校验。
+
+RedisStreamRagSegmentQueue
+  负责 Stream 创建、消息投递、消费、Pending 恢复、ACK、重试、死信和进度统计。
+
+SegmentSummaryServiceImpl
+  调用聊天模型生成片段摘要，并使用 Redis 分布式锁控制全局 LLM 并发。
+
+RagSegmentStreamConsumer
+  Spring SmartLifecycle 后台消费者。按顺序完成摘要、向量化、pgvector 写入和 ACK。
+
+4. entity 和 repository
+
+FileInfo
+  对应 jinyan.tb_file_info，保存 fileId、fileName 和完整 fileContext。
+
+RagSegmentMessage
+  Redis Stream 消息模型，保存片段内容、片段位置、重试次数等字段。
+
+RagIngestionStatus
+  文档级异步任务状态模型。
+
+RelevantContext
+  向量检索结果 DTO，包含相似度、原始片段和 fileId。
+
+FileInfoRepository
+  JpaRepository<FileInfo, String>，提供标准 CRUD 能力。
+
+
+======================================================================
+五 普通对话与流式对话原理
+======================================================================
+
+1. 普通对话
+
+调用链：
+
+GET /assistant/ds/ask
+  -> DeepSeekController.getAnswer
+  -> DeepSeekService.chat
+  -> OpenAiChatModel.chat
+  -> DeepSeek OpenAI 兼容接口
+  -> 一次性返回完整字符串
+
+为什么使用 OpenAI 兼容客户端：
+
+DeepSeek 提供与 OpenAI 风格兼容的接口。LangChain4j 的 OpenAiChatModel 可以通过
+baseUrl、apiKey 和 modelName 切换到 DeepSeek，无需自行维护 HTTP 请求格式、
+响应反序列化和模型消息协议。
+
+2. SSE 流式对话
+
+调用链：
+
+GET /assistant/ds/streamChat
+  -> 创建 SseEmitter，超时 180 秒
+  -> OpenAiStreamingChatModel.chat
+  -> onPartialResponse
+  -> SseEmitter.send
+  -> 浏览器持续接收片段
+  -> onCompleteResponse 后关闭连接
+
+为什么使用 SSE：
+
+大模型生成完整答案可能需要较长时间。SSE 使用单向长连接，服务端可以持续向浏览器
+推送文本，不需要等待完整答案。相比 WebSocket，SSE 更适合这种“客户端发起一次请求，
+服务端持续返回”的单向场景，协议和前端处理更简单。
+
+3. Agent 和本地 Tool
+
+SmartAssistantAgent 使用 LangChain4j @AiService。UserToolUtil 使用 @Tool 暴露：
+
+- 当前日期
+- 上海温度模拟值
+- 根据温度推荐活动
+
+模型可以根据工具说明决定是否调用 Java 方法。这属于 LangChain4j 进程内 Tool，
+不是 MCP。Tool 与应用运行在同一个 JVM 内，部署和调用简单，但不能自动被其他 AI
+客户端复用。
+
+
+======================================================================
+六 文档上传与 RAG 入库完整流程
+======================================================================
+
+1. 接收文档
+
+入口：POST /assistant/embedding/uploadDocument
+请求类型：multipart/form-data
+字段：file
+
+Controller 先拒绝空文件，再把 originalFilename、contentType 和 InputStream 交给
+VectorService。
+
+2. 根据 Content Type 选择解析器
+
+VectorServiceImpl.selectParser 的当前规则：
+
+- application/pdf 使用 ApachePdfBoxDocumentParser。
+- text/* 使用 UTF-8 TextDocumentParser。
+- application/json、application/xml、application/yaml、application/x-yaml 使用文本解析器。
+- Content Type 缺失或为 application/octet-stream 时，根据扩展名兜底判断。
+- 当前支持的扩展名兜底包括 pdf、txt、md、json、xml、yaml、yml。
+- 无法匹配时抛出 Unsupported content type。
+
+为什么优先使用 Content Type：
+
+Content Type 表达上传内容的媒体类型，比只看文件后缀更符合 HTTP 语义。文件后缀仅用作
+客户端没有正确提交 Content Type 时的兼容措施。
+
+当前限制：
+
+- PDFBox 只能直接提取带文本层的 PDF。
+- 扫描件 PDF 没有文本层，需要 OCR，目前尚未实现。
+- 文本统一按 UTF-8 读取，GBK 等编码文件可能乱码。
+- 当前没有 DOCX、XLSX、PPTX、HTML 等专用解析器。
+
+3. 保存完整原文
+
+解析成功后，FileServiceImpl 生成随机 UUID，并写入 jinyan.tb_file_info：
+
+- file_id：文档唯一标识
+- file_name：原始文件名
+- file_context：完整解析文本，PostgreSQL text 类型
+
+为什么既保存原文又保存向量片段：
+
+向量检索只能返回局部片段，不能替代完整文件。保留原文后，可以通过 fileId 回查完整
+上下文，也方便重新切片、重新生成向量、审计来源和更换 Embedding 模型。
+
+4. 文档切片
+
+当前文档上传使用：
+
+DocumentSplitters.recursive(500, 100)
+
+直接文本入库使用：
+
+DocumentSplitters.recursive(300, 30)
+
+第一个参数控制单片最大规模，第二个参数控制相邻片段重叠。递归切片器优先尝试在自然
+边界处分割，无法满足大小限制时再逐级细分。
+
+为什么需要重叠：
+
+一句话或一个事实可能跨越切片边界。适量重叠能把边界附近的上下文同时保留在相邻片段
+中，提高检索完整性。代价是向量数量、存储量和 Embedding 计算量增加。
+
+5. 生成确定性 segmentId
+
+每个片段使用以下信息生成 UUID：
+
+fileId + ":" + segmentIndex
+
+同一文件的同一片段在重试时始终得到相同 segmentId。这个 ID 是后续分布式锁、Redis
+完成集合和 pgvector upsert 的共同幂等键。
+
+6. 投递 Redis Stream
+
+上传线程将每个片段转换成 RagSegmentMessage，字段包括：
+
+- segmentId
+- fileId
+- source
+- contentType
+- segmentIndex
+- segmentCount
+- text
+- retryCount
+
+消息写入 rag:segment:stream。投递完成后，上传接口返回 fileId。此时只表示“原文已经
+保存并且片段已经入队”，不表示向量已经全部生成。
+
+7. 后台摘要和向量化
+
+RagSegmentStreamConsumer 每次读取一个片段，处理顺序为：
+
+1) 获取 segmentId 对应的分布式处理锁。
+2) 检查片段是否已经进入成功或最终失败状态。
+3) 将文档任务状态更新为 PROCESSING。
+4) 调用 SegmentSummaryService 生成摘要。
+5) 构造带 metadata 的 TextSegment。
+6) 使用 Ollama EmbeddingModel 生成向量。
+7) 使用固定 segmentId 写入 knowledgeEmbeddingStore。
+8) 将片段记录为完成。
+9) ACK 并删除 Stream 原消息。
+
+向量 metadata 包含：
+
+- source
+- contentType
+- fileId
+- documentId
+- segmentId
+- segmentIndex
+- segmentCount
+- summary
+
+系统向量化和保存的主体仍是原始片段，summary 只写入 metadata。这样既保留原文检索
+能力，又能在后续上下文组织、结果展示或重排序时利用摘要。
+
+
+======================================================================
+七 Redis Stream 的原理与选型原因
+======================================================================
+
+1. Stream 是什么
+
+Redis Stream 是按顺序追加的消息日志。每条消息有唯一 StreamMessageId 和多个字段。
+它与简单 List 的主要区别是支持消费组、消息确认、Pending 列表和消费者故障恢复。
+
+2. 为什么项目使用 Stream
+
+摘要和向量化属于高延迟、容易失败且受并发限制的任务。如果直接放在上传 HTTP 请求中：
+
+- 大文件会导致接口长时间不返回。
+- LLM 限流会直接导致用户上传失败。
+- 应用重启会丢失当前处理进度。
+- 多文件并发上传可能瞬间触发大量模型请求。
+
+Stream 将“接收文档”和“模型处理”解耦。上传接口快速返回，后台消费者按系统能够承受
+的速度执行任务。
+
+3. 消费组
+
+项目消费组名称为 rag-summary-workers。多个应用实例使用同一个组时，一条消息只分配给
+组内某一个消费者，而不是让每个实例都处理一遍。
+
+消费者名称默认使用 HOSTNAME 加 UUID，避免不同实例重名。
+
+4. ACK
+
+消费者读取消息后，消息进入消费组的 Pending Entries List。ACK 表示业务已经完成，
+Redis 可以从 Pending 列表中移除这条消息。
+
+项目只在摘要、向量化、pgvector 写入和状态记录全部成功后执行 ACK。ACK 后还调用
+Stream remove 删除消息本体，避免主 Stream 无限增长。
+
+5. Pending 恢复
+
+如果消费者读取消息后进程崩溃，它没有机会 ACK，消息会留在 Pending 列表。消费者循环
+优先调用 autoClaim。当前 pending-idle-timeout 为 60 秒，超过 60 秒未完成的消息可以
+被当前消费者接管。
+
+该功能依赖 Redis XAUTOCLAIM，Redis 版本应不低于 6.2。
+
+6. 失败重试
+
+Redis Stream 本身不会自动完成业务重试。项目的 retry 方法采用：
+
+1) 写入 retryCount + 1 的新消息。
+2) 新消息写入成功后 ACK 并删除旧消息。
+
+顺序必须是先写新消息、后 ACK 旧消息。如果写新消息失败，旧消息仍保留在 Pending 中，
+不会静默丢失。
+
+max-retries 当前为 3，因此最多执行 4 次：首次执行加 3 次重试。
+
+7. 死信队列
+
+重试耗尽后，消息写入 rag:segment:dead-letter。死信保留原消息字段和最后一次 error，
+随后将片段标记为失败并 ACK 原消息。
+
+死信的目的不是自动修复，而是隔离永久失败的任务，避免某个坏片段无限占用消费者。
+后续应增加死信查询、告警和人工重新投递接口。
+
+8. 任务状态
+
+项目在 Redis 中记录以下文档状态：
+
+- QUEUED：片段已入队。
+- PROCESSING：至少一个片段正在处理。
+- COMPLETED：全部片段成功。
+- PARTIALLY_FAILED：部分成功、部分最终失败。
+- FAILED：全部片段最终失败。
+
+RMap 保存任务状态和总片段数，RAtomicLong 保存成功及失败计数，RSet 保存已经完成或失败
+的 segmentId。Set.add 只在首次写入时返回 true，可以避免重复消费导致计数重复增加。
+
+
+======================================================================
+八 幂等性设计
+======================================================================
+
+幂等表示同一业务消息执行一次或多次，最终业务结果保持一致，不生成重复向量。
+
+Redis 消息系统通常是“至少一次投递”而不是“绝对只投递一次”。以下场景可能产生重复：
+
+- 数据库写入成功后，应用在 ACK 前崩溃。
+- 重试新消息写入成功后，应用在 ACK 旧消息前崩溃。
+- 多个实例同时尝试接管超时 Pending 消息。
+
+当前项目使用四层保护：
+
+1. 确定性 segmentId
+   fileId 和 segmentIndex 相同，segmentId 就相同。
+
+2. 片段级 Redis 分布式锁
+   锁名为 rag:segment:process-lock:{segmentId}，避免不同实例并行处理同一片段。
+
+3. Redis 完成集合
+   消费前检查 segmentId 是否已经成功或最终失败。已经完成的重复消息直接 ACK。
+
+4. pgvector 固定 ID 写入
+   EmbeddingStore.addAll 显式传入 segmentId。重复执行针对同一个 embedding_id 更新，而不
+   是生成新的随机记录。
+
+由于具备幂等保护，系统允许少量重复执行来换取“不轻易丢消息”。这是异步任务系统中
+常见且合理的取舍。
+
+
+======================================================================
+九 LLM 摘要与并发控制
+======================================================================
+
+1. 摘要目的
+
+每个文档片段在向量化之前调用聊天模型生成简短摘要，要求保留关键事实、名称、数字和
+约束，不补充原文没有的信息，并控制在约 120 个中文字符内。
+
+摘要当前只保存在向量 metadata 中，不替换原始片段。后续可以用于：
+
+- 检索结果快速预览。
+- 将多个召回片段压缩后交给回答模型。
+- 二次重排序或去重。
+- 让模型先阅读摘要，再按需读取完整片段。
+
+2. 为什么使用 Redis 分布式锁
+
+单线程 Executor 只能限制单个 JVM。如果部署两个应用实例，每个实例仍可各发一个 LLM
+请求。SegmentSummaryService 使用全局锁 rag:summary:llm-lock，所有实例必须先获取同一
+把锁，因此集群同一时刻最多有一个摘要请求。
+
+Redisson 的无固定租期 lockInterruptibly 使用锁看门狗续期。模型调用较慢时，不会因为
+预设租期到期而让第二个实例错误进入临界区。线程中断时保留中断状态且不 ACK 消息。
+
+3. 当前限制
+
+分布式锁解决的是并发数，不等于完整的每分钟请求数控制。即使并发为 1，快速连续请求
+仍可能超过供应商 RPM 或 TPM 配额。后续应增加最小调用间隔、令牌桶或供应商限流响应的
+指数退避。
+
+
+======================================================================
+十 Embedding 与 pgvector 检索原理
+======================================================================
+
+1. Embedding
+
+Embedding 模型把文本映射为固定维度的浮点向量。语义相近的文本在向量空间中距离更近。
+当前使用本机 Ollama 的 qwen3-embedding:4b，配置向量维度为 2560。
+
+为什么本地运行 Embedding：
+
+- 文档片段不必发送给外部 Embedding 服务。
+- 没有按调用次数计费。
+- 网络断开时仍可向量化。
+- 可以自行控制模型和数据位置。
+
+代价是本机或服务器需要足够内存和算力，吞吐量受部署机器限制。
+
+2. pgvector
+
+pgvector 为 PostgreSQL 增加 vector 类型和向量距离运算。项目通过
+PgVectorEmbeddingStore 访问，不直接拼接 SQL。
+
+选择 pgvector 的原因：
+
+- 项目本来就使用 PostgreSQL。
+- 原文、业务数据和向量可以使用同一套备份及权限体系。
+- 开发和中小规模知识库的运维成本低于额外部署专用向量数据库。
+- LangChain4j 已提供 EmbeddingStore 适配。
+
+当数据达到千万级、需要复杂分片或极高吞吐时，再评估专用向量数据库更合理。
+
+3. 多向量表
+
+PgVectorStoreConfig 当前创建 knowledgeEmbeddingStore 和 userEmbeddingStore。通过 Spring
+Bean 名称和 @Qualifier 选择目标表，因此项目不受“一套系统只能有一张向量表”的限制。
+
+知识库入库和检索明确注入 knowledgeEmbeddingStore。新增业务向量表时，应增加对应 Bean
+或建立按业务类型路由的 Store Registry，不能只依赖 @Primary 隐式选择。
+
+4. 查询过程
+
+searchRelevantContext 的流程：
+
+1) 使用同一个 EmbeddingModel 将用户问题转成向量。
+2) 构造 EmbeddingSearchRequest。
+3) maxResults 使用调用方提供的 Top K。
+4) minScore 固定为 0.7。
+5) pgvector 搜索相似向量。
+6) 返回 score、片段原文和 fileId。
+
+入库和查询必须使用同一个模型及向量维度。更换 Embedding 模型后，旧向量通常不能继续
+与新查询向量混用，需要重新生成整个索引。
+
+
+======================================================================
+十一 JPA 原文存储原理
+======================================================================
+
+FileInfo 使用 @Entity 映射 jinyan.tb_file_info。FileInfoRepository 继承 JpaRepository，
+Spring Data JPA 在运行时生成常用 CRUD 实现。
+
+FileServiceImpl.saveFile 使用 @Transactional，保证一次保存运行在事务中；getFile 使用
+@Transactional(readOnly = true)，向持久化层表达只读意图。
+
+选择 JPA 的原因：
+
+- 实体和表字段映射明确。
+- Repository 减少常规 CRUD 样板代码。
+- Spring 事务管理统一。
+- 后续增加文档状态、创建时间、上传人等字段较方便。
+
+当前 FileInfo 只有完整文本，没有文件二进制、Content Type、校验和、创建时间、文件大小
+和上传用户。若需要下载原文件或审计，应增加这些字段或使用对象存储保存二进制文件。
+
+
+======================================================================
+十二 当前接口清单
+======================================================================
+
+应用 Context Path：/assistant
+
+方法   路径                                  作用
+----------------------------------------------------------------------
+GET    /ds/ask                               普通 DeepSeek 对话
+GET    /ds/streamChat                        SSE 流式对话
+GET    /ds/talkToAgent                       LangChain4j Agent 对话
+POST   /embedding/addKnowledge               直接文本异步入库
+POST   /embedding/searchRelevantContext      向量相似度检索
+POST   /embedding/readDocument               读取服务器本地文件并入库
+POST   /embedding/uploadDocument             上传文件并异步入库
+GET    /embedding/ingestion/{fileId}          查询异步入库状态
+GET    /files/{fileId}                       查询完整文件原文
+
+uploadDocument 返回 fileId 后，调用方应轮询 ingestion 状态，直到 COMPLETED、
+PARTIALLY_FAILED 或 FAILED，而不是把拿到 fileId 当作全部向量已经可检索。
+
+
+======================================================================
+十三 配置项说明
+======================================================================
+
+1. PostgreSQL
+
+spring.datasource.url
+  数据库地址，并通过 currentSchema=jinyan 设置默认 Schema。
+
+spring.datasource.hikari
+  minimum-idle 为 5，maximum-pool-size 为 15，控制数据库连接池。
+
+spring.jpa.hibernate.ddl-auto=none
+  Hibernate 不自动修改业务表结构，适合已有数据库，但需要人工或迁移工具维护 DDL。
+
+2. Redis
+
+spring.data.redis.url
+  Redisson 单机模式连接地址，当前默认 redis://127.0.0.1:6379。
+
+3. DeepSeek
+
+langchain.deep-seek
+  配置 apiKey、baseUrl、modelName、maxTokens。
+
+4. Ollama
+
+langchain4j.ollama.embedding-model
+  配置 Ollama 地址、Embedding 模型名称和 60 秒超时。
+
+5. RAG 队列
+
+assistant.rag.ingestion.stream-key
+  主 Stream 名称。
+
+assistant.rag.ingestion.dead-letter-stream-key
+  死信 Stream 名称。
+
+assistant.rag.ingestion.consumer-group
+  消费组名称。
+
+assistant.rag.ingestion.llm-lock-key
+  摘要模型全局分布式锁名称。
+
+assistant.rag.ingestion.max-retries
+  首次执行失败后的重试次数。
+
+assistant.rag.ingestion.read-timeout
+  阻塞读取新消息的超时。
+
+assistant.rag.ingestion.pending-idle-timeout
+  Pending 消息允许被其他消费者接管前的空闲时间。
+
+
+======================================================================
+十四 部署拓扑与运行依赖
+======================================================================
+
+推荐的单机开发拓扑：
+
+Spring Boot :8080
+PostgreSQL  :5432
+Redis       :6379
+Ollama      :11434
+DeepSeek    外部 HTTPS API
+
+推荐的服务器拓扑：
+
+互联网或内网客户端
+        |
+        v
+Nginx 或 API Gateway
+        |
+        v
+多个 Spring Boot 实例
+        |
+        +---- PostgreSQL + pgvector
+        +---- Redis
+        +---- Ollama Embedding 服务
+        +---- DeepSeek API
+
+部署要求：
+
+- PostgreSQL 安装 vector 扩展，扩展位于 jinyan Schema 的设计需要与数据库初始化脚本一致。
+- PgVectorStore 配置 skipCreateVectorExtension=true，因此应用不会自动创建扩展。
+- knowledge_vector_store 和 user_vector_store 的向量维度必须为 2560。
+- Redis 建议 6.2 或更高版本，以支持 XAUTOCLAIM。
+- Ollama 预先拉取 qwen3-embedding:4b。
+- 只有 Spring Boot 或网关应对外开放；PostgreSQL、Redis、Ollama 不应直接暴露公网。
+- 生产环境必须使用 HTTPS、身份认证、访问控制和密钥管理。
+
+
+======================================================================
+十五 当前设计的主要优点
+======================================================================
+
+1. 业务原文与向量分离
+   向量用于召回，原文用于回查和重建，数据职责清楚。
+
+2. 上传和模型处理解耦
+   Redis Stream 避免大文件摘要和向量化长期占用 HTTP 请求。
+
+3. 具备至少一次投递和恢复能力
+   Pending、ACK 和 autoClaim 能应对消费者异常退出。
+
+4. 具备基础幂等保护
+   固定 segmentId、片段锁、完成 Set 和 pgvector 固定 ID 共同处理重复消息。
+
+5. 控制集群级 LLM 并发
+   Redis 锁比单机线程池更适合多实例部署。
+
+6. 本地 Embedding 降低隐私和调用成本
+   原文向量化不依赖外部 Embedding API。
+
+7. 使用 Qualifier 支持多向量表
+   knowledge 和 user 数据可以放在不同向量表中。
+
+
+======================================================================
+十六 当前风险与改进建议
+======================================================================
+
+以下内容是对当前代码的客观检查，不代表这些能力已经实现。
+
+优先级 P0 安全问题
+
+1. 配置文件中存在明文数据库密码和模型 API Key
+   应立即改为环境变量、Kubernetes Secret、Vault 或云密钥服务。历史提交中若出现过真实
+   Key，还应轮换密钥，而不是只删除配置文本。
+
+2. 接口没有身份认证和权限控制
+   uploadDocument、readDocument、files/{fileId} 等接口可能暴露敏感文档。建议接入
+   Spring Security，至少区分上传、检索、查看原文和管理权限。
+
+3. readDocument 接受服务器本地路径
+   如果该接口暴露给不可信用户，可能读取服务器上应用账号有权限访问的文件。生产环境应
+   删除该公网接口，或限定到白名单目录并做严格路径校验。
+
+优先级 P1 可靠性和架构问题
+
+4. DeepSeekConfig 使用 static 字段
+   建议改为普通不可变 @ConfigurationProperties，通过构造器注入，避免初始化顺序问题和
+   隐式全局状态。
+
+5. ChatModel 存在重复构建
+   AgentConfiguration 创建 Spring Bean，DeepSeekServiceImpl 又在构造器中手动创建同步和
+   流式模型。建议统一由配置类创建 Bean，Service 只负责注入。
+
+6. 开启 logRequests 和 logResponses
+   文档片段、用户问题和模型回答可能进入日志。生产环境应关闭或脱敏，并确认 Authorization
+   Header 不会被记录。
+
+7. 数据库保存与 Redis 投递不是一个原子事务
+   原文保存成功但 Redis 投递失败时，会产生没有向量任务的孤立文件。建议使用 Outbox
+   Pattern，或保存 ingestion 状态后由补偿任务扫描重投。
+
+8. 重试没有退避
+   当前失败后立即重新写入 Stream。供应商限流或模型故障时可能连续快速失败。建议指数退避
+   加随机抖动，并区分可重试错误与永久错误。
+
+9. 全局锁只限制并发，不限制 RPM 和 TPM
+   建议增加令牌桶、最小请求间隔，或根据供应商响应头动态限流。
+
+10. Redis 任务状态没有 TTL
+    文档任务 RMap、计数器和完成 Set 会长期保留。建议完成后设置合理过期时间，并对死信
+    Stream 设置保留策略和监控。
+
+11. Stream 重试与 ACK 不是 Redis 事务
+    新消息写入后、旧消息 ACK 前崩溃会形成重复消息。当前幂等设计可以消化重复，但仍建议
+    添加监控，并评估 Lua 脚本是否值得用于原子转投。
+
+12. 摘要结果只依赖提示词限制长度
+    模型可能不遵守 120 字限制。建议增加服务端长度校验、清洗和必要时截断或二次压缩。
+
+13. 没有 OCR 和丰富格式解析
+    建议按业务优先级接入 OCR、Apache Tika、POI 或专用 DOCX/XLSX/PPTX 解析器。
+
+14. 文本编码固定 UTF-8
+    可增加 BOM 和编码检测，或在上传接口明确只接受 UTF-8。
+
+15. 切片参数写死在代码中
+    500/100 与 300/30 应移入配置，并按文档类型、模型上下文和检索效果调优。
+
+16. 检索阈值固定为 0.7
+    不同模型和数据集的分数分布不同。应通过离线评测确定阈值，并允许按知识库配置。
+
+17. 缺少文档删除的一致性流程
+    删除文档时需要同时处理原文、全部向量、Redis 状态和在途消息。建议以 fileId 为条件
+    设计完整删除或逻辑删除流程。
+
+18. FileController 直接返回 Entity
+    建议使用 DTO，避免未来实体字段变化直接改变公网响应，也便于控制是否返回完整原文。
+
+优先级 P2 测试和可观测性
+
+19. 原有 AidemoApplicationTests 包名错误
+    测试类位于 com.jinyan.aidemo，启动类位于 com.jinyan.assistant，Spring Boot 测试无法
+    向上找到 @SpringBootConfiguration。应修正测试包名或显式指定启动类。
+
+20. 当前测试覆盖较少
+    已有 RagSegmentMessage 的字段往返和 retryCount 测试。还应增加：
+    - 文件类型选择测试
+    - 切片及 metadata 测试
+    - ACK 时机测试
+    - 重试和死信测试
+    - Pending 恢复测试
+    - 重复消息幂等测试
+    - Testcontainers PostgreSQL pgvector 和 Redis 集成测试
+
+21. 缺少指标和告警
+    建议使用 Spring Boot Actuator 和 Micrometer 记录队列积压、Pending 数、处理耗时、模型
+    调用耗时、重试数、死信数和文档成功率。
+
+22. 缺少统一异常响应
+    建议使用 @RestControllerAdvice，统一参数错误、文件解析错误、模型错误和基础设施错误的
+    HTTP 状态码及响应结构。
+
+
+======================================================================
+十七 MCP 与当前项目的关系
+======================================================================
+
+当前项目没有 MCP 依赖、MCP Client 或 MCP Server。LangChain4j @Tool 是进程内 Java Tool，
+不能等同于 MCP。
+
+后续若希望 Codex、Claude Desktop 或其他支持 MCP 的 AI 客户端直接调用本知识库，可以在
+现有 Service 外增加 MCP Adapter，对外提供 Streamable HTTP MCP 端点，例如 /mcp。
+
+优先暴露只读工具：
+
+- search_knowledge：调用 VectorService 搜索知识库。
+- get_document：调用 FileService 获取完整原文。
+- get_ingestion_status：查询异步入库状态。
+- list_documents：查询可访问文档列表，需要新增分页 Service。
+
+REST 与 Swagger 仍然保留给前端和普通业务系统；MCP 用于 AI 客户端的工具发现和调用。
+Swagger/OpenAPI 文档本身不是 MCP Server，除非目标 AI 平台明确支持把 OpenAPI 自动转换
+成 Tool。
+
+
+======================================================================
+十八 推荐演进路线
+======================================================================
+
+第一阶段 安全和配置
+
+1. 轮换并移除代码库中的明文密钥。
+2. 接入 Spring Security 和接口权限。
+3. 统一 ChatModel Bean 和 ConfigurationProperties。
+4. 关闭生产环境模型请求及响应明文日志。
+
+第二阶段 入库可靠性
+
+1. 增加 Outbox 或补偿扫描，解决数据库和 Redis 双写一致性。
+2. 增加指数退避、死信管理接口和状态 TTL。
+3. 增加 OCR、DOCX 等解析器。
+4. 切片大小、阈值和摘要长度配置化。
+
+第三阶段 检索质量
+
+1. 建立包含真实问题和标准答案的 RAG 评测集。
+2. 调整 Top K、minScore、切片大小和重叠量。
+3. 增加关键词与向量混合检索。
+4. 增加 reranker 和相邻片段扩展。
+5. 根据 fileId 回取完整上下文，避免答案被单片截断。
+
+第四阶段 可运维性
+
+1. 增加 Actuator、Micrometer 和监控看板。
+2. 增加结构化日志、Trace ID 和文档任务 ID。
+3. 使用 Testcontainers 建立 Redis 与 pgvector 集成测试。
+4. 增加数据库迁移工具 Flyway 或 Liquibase。
+
+第五阶段 AI 对外集成
+
+1. 保留 REST 和 OpenAPI 供传统客户端使用。
+2. 增加只读 MCP Server 工具。
+3. 完成 MCP 身份认证、租户隔离、审计和调用配额。
+4. 再逐步开放上传、重试、删除等高风险写工具。
+
+
+======================================================================
+十九 运维检查清单
+======================================================================
+
+应用启动前：
+
+[ ] PostgreSQL 可以连接。
+[ ] jinyan Schema 已存在。
+[ ] vector 扩展已按预期安装。
+[ ] 两张向量表维度与 2560 一致。
+[ ] tb_file_info 表字段与 FileInfo 匹配。
+[ ] Redis 可以连接且版本不低于 6.2。
+[ ] Ollama 服务可以连接。
+[ ] qwen3-embedding:4b 已拉取完成。
+[ ] DeepSeek Base URL、模型名称和密钥有效。
+[ ] 密钥来自安全配置，不是代码库明文。
+
+运行期间：
+
+[ ] 观察 rag:segment:stream 积压。
+[ ] 观察消费组 Pending 数量和最长空闲时间。
+[ ] 观察 rag:segment:dead-letter 是否增长。
+[ ] 观察 LLM 限流、超时和失败率。
+[ ] 观察 Ollama 内存、CPU 或 GPU 使用率。
+[ ] 观察 PostgreSQL 连接池和慢查询。
+[ ] 检查长时间停留在 PROCESSING 的 fileId。
+
+故障排查顺序：
+
+1. 查询 /embedding/ingestion/{fileId}。
+2. 检查应用日志中的 fileId 和 segmentIndex。
+3. 检查 Redis 消费组 Pending。
+4. 检查死信 Stream 中的 error。
+5. 检查 DeepSeek 和 Ollama 连通性。
+6. 检查 pgvector 表是否存在固定 segmentId 记录。
+7. 检查完整原文是否已经写入 tb_file_info。
+
+
+======================================================================
+二十 关键术语
+======================================================================
+
+RAG
+  Retrieval Augmented Generation，检索增强生成。先从知识库检索相关资料，再让模型基于
+  资料回答，降低纯模型记忆带来的错误。
+
+Embedding
+  将文本转换成语义向量的过程。
+
+Top K
+  一次向量检索返回相似度最高的 K 条结果。
+
+Metadata
+  与向量片段共同保存的结构化信息，例如 fileId、来源、片段序号和摘要。
+
+Consumer Group
+  Redis Stream 的消费者协作机制，组内消费者共同分摊消息。
+
+Pending
+  已经投递给消费者、但尚未 ACK 的消息集合。
+
+ACK
+  Acknowledge，消费者确认业务处理成功。
+
+Dead Letter
+  多次处理仍失败后隔离保存的消息，便于排查和人工恢复。
+
+Idempotency
+  幂等性。同一个操作重复执行，最终业务结果与执行一次一致。
+
+Distributed Lock
+  分布式锁。多个应用实例通过共享存储协调，避免同时执行同一临界任务。
+
+SSE
+  Server Sent Events，服务器通过一个 HTTP 长连接持续向客户端推送事件。
+
+MCP
+  Model Context Protocol，AI 客户端发现和调用外部工具或资源的标准协议。当前项目尚未
+  实现。
+
+
+======================================================================
+二十一 关键源码索引
+======================================================================
+
+应用入口
+  src/main/java/com/jinyan/assistant/AssistantApplication.java
+
+聊天模型和记忆
+  src/main/java/com/jinyan/assistant/config/AgentConfiguration.java
+  src/main/java/com/jinyan/assistant/service/impl/DeepSeekServiceImpl.java
+
+文件解析、切片和检索
+  src/main/java/com/jinyan/assistant/service/impl/VectorServiceImpl.java
+
+Redis Stream
+  src/main/java/com/jinyan/assistant/service/RedisStreamRagSegmentQueue.java
+  src/main/java/com/jinyan/assistant/worker/RagSegmentStreamConsumer.java
+  src/main/java/com/jinyan/assistant/entity/RagSegmentMessage.java
+
+摘要服务
+  src/main/java/com/jinyan/assistant/service/impl/SegmentSummaryServiceImpl.java
+
+向量表配置
+  src/main/java/com/jinyan/assistant/config/PgVectorStoreConfig.java
+
+原文存储
+  src/main/java/com/jinyan/assistant/entity/FileInfo.java
+  src/main/java/com/jinyan/assistant/repository/FileInfoRepository.java
+  src/main/java/com/jinyan/assistant/service/impl/FileServiceImpl.java
+
+接口入口
+  src/main/java/com/jinyan/assistant/controller/DeepSeekController.java
+  src/main/java/com/jinyan/assistant/controller/PgVectorController.java
+  src/main/java/com/jinyan/assistant/controller/FileController.java
+
+主要配置
+  pom.xml
+  src/main/resources/application.yml
+
+
+======================================================================
+结论
+======================================================================
+
+当前项目已经形成一条完整的基础 RAG 链路：文档解析、JPA 原文保存、递归切片、Redis
+Stream 异步调度、LLM 摘要、本地 Embedding、pgvector 入库、状态查询和向量召回。
+
+设计中最关键的部分不是单独某个模型，而是 Redis Stream 提供的异步解耦，以及固定
+segmentId、分布式锁、完成集合和数据库 upsert 共同形成的可靠性基础。
+
+下一步应优先解决密钥和鉴权问题，再完善双写一致性、重试退避、OCR、测试与监控。完成
+这些基础能力后，再增加 MCP 对外工具层，会比直接暴露当前接口更稳妥。

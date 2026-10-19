@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Assistant 知识库工作台">
+    <title>Assistant · 知识库工作台</title>
+    <link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div class="shell">
+    <header class="topbar">
+        <div class="brand-lockup">
+            <span class="brand-mark">A</span>
+            <div>
+                <p class="eyebrow">ASSISTANT / RAG WORKSPACE</p>
+                <h1>知识库工作台</h1>
+            </div>
+        </div>
+        <div class="topbar-meta">
+            <span class="status-dot"></span>
+            <span>本地服务</span>
+            <button class="icon-button" id="new-session-button" type="button" title="新建会话" aria-label="新建会话">＋</button>
+            <button class="icon-button" id="refresh-button" type="button" title="刷新文件列表" aria-label="刷新文件列表">↻</button>
+        </div>
+    </header>
+
+    <main class="workspace">
+        <section class="library-panel panel">
+            <div class="panel-heading">
+                <div>
+                    <p class="section-kicker">LIBRARY</p>
+                    <h2>文档库</h2>
+                </div>
+                <span class="count-badge" id="file-count">0</span>
+            </div>
+
+            <div class="upload-zone" id="upload-zone" tabindex="0" role="button" aria-label="选择文档上传">
+                <input id="file-input" type="file" multiple accept=".pdf,.txt,.md,.json,.xml,.yaml,.yml,text/*,application/pdf">
+                <div class="upload-icon">↑</div>
+                <strong>拖入文档，或点击选择</strong>
+                <span>PDF、TXT、Markdown、JSON、XML、YAML</span>
+            </div>
+            <div class="upload-queue" id="upload-queue" aria-live="polite"></div>
+
+            <div class="library-toolbar">
+                <label class="search-field">
+                    <span aria-hidden="true">⌕</span>
+                    <input id="file-filter" type="search" placeholder="筛选文件" autocomplete="off">
+                </label>
+                <span class="muted" id="library-updated">等待同步</span>
+            </div>
+            <div class="file-list" id="file-list" aria-live="polite">
+                <div class="empty-state compact">还没有上传文档</div>
+            </div>
+        </section>
+
+        <section class="chat-panel panel">
+            <div class="chat-heading">
+                <div>
+                    <p class="section-kicker">KNOWLEDGE QUERY</p>
+                    <h2>知识库问答</h2>
+                </div>
+                <div class="retrieval-control">
+                    <label for="max-results">召回资料</label>
+                    <select id="max-results">
+                        <option value="3">3 条</option>
+                        <option value="5" selected>5 条</option>
+                        <option value="8">8 条</option>
+                        <option value="10">10 条</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="conversation" id="conversation" aria-live="polite">
+                <div class="welcome-block" id="welcome-block">
+                    <span class="welcome-line"></span>
+                    <p class="section-kicker">READY WHEN YOU ARE</p>
+                    <h3>从已入库的资料中<br>找到可靠答案。</h3>
+                    <p>回答会实时生成，并附带本次使用的原始资料。</p>
+                </div>
+            </div>
+
+            <form class="question-form" id="question-form">
+                <textarea id="question-input" rows="1" maxlength="2000" placeholder="询问知识库中的内容……" aria-label="输入知识库问题"></textarea>
+                <div class="composer-footer">
+                    <span class="muted">回答仅基于已召回的资料</span>
+                    <button class="primary-button" id="ask-button" type="submit">
+                        <span>发送问题</span><span aria-hidden="true">↗</span>
+                    </button>
+                </div>
+            </form>
+        </section>
+
+        <aside class="detail-panel panel" id="detail-panel">
+            <div class="panel-heading">
+                <div>
+                    <p class="section-kicker">DOCUMENT DETAIL</p>
+                    <h2>文档详情</h2>
+                </div>
+                <button class="icon-button" id="close-detail" type="button" title="关闭详情" aria-label="关闭详情">×</button>
+            </div>
+            <div id="detail-content" class="detail-content">
+                <div class="empty-state">选择一个文档查看原文与处理状态</div>
+            </div>
+        </aside>
+    </main>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

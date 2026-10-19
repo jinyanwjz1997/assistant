@@ -36,6 +36,14 @@ langchain:
     baseUrl: https://api.deepseek.com
     modelName: deepseek-v4-pro
     maxTokens: 100000
+    # 普通聊天保留客户端内部重试；RAG 摘要由 Redis Stream 统一重试，避免双重重试放大请求量。
+    timeout: 120s
+    max-retries: 2
+    summary-timeout: 120s
+    # 摘要使用非推理模型，避免 Token 被 reasoning 内容耗尽后返回空正文。
+    summary-model-name: deepseek-chat
+    summary-max-tokens: 1024
+    summary-max-retries: 0
 logging:
   charset:
     console: UTF-8
@@ -52,7 +60,20 @@ langchain4j:
   rag:
 
 assistant:
+  memory:
+    # 短期窗口按消息条数滑动，用户消息和助手消息分别计数。
+    short-term-max-messages: 10
+    # 长期记忆向量检索最多返回的历史问答数。
+    long-term-max-results: 3
+    long-term-min-score: 0.65
+    long-term-enabled: true
   rag:
+    chunking:
+      # 当前按字符数计算；后续接入与 Embedding 模型一致的 Tokenizer 后可改为 Token 数。
+      child-max-characters: 600
+      child-overlap-characters: 100
+      min-child-characters: 120
+      parent-max-characters: 2400
     ingestion:
       stream-key: rag:segment:stream
       dead-letter-stream-key: rag:segment:dead-letter
@@ -60,4 +81,5 @@ assistant:
       llm-lock-key: rag:summary:llm-lock
       max-retries: 3
       read-timeout: 2s
-      pending-idle-timeout: 60s
+      # 必须大于单次摘要请求超时，避免其他实例提前接管仍在处理的消息。
+      pending-idle-timeout: 3m
