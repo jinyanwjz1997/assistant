@@ -6,7 +6,8 @@ public record VectorQuery(
         String sourceFile,
         int maxResult,
         String conversationId,
-        Boolean includeMemory
+        Boolean includeMemory,
+        KnowledgeMetadataFilter metadataFilter
 ) {
 
     /**
@@ -17,7 +18,26 @@ public record VectorQuery(
      * @param maxResult 最大结果数
      */
     public VectorQuery(String context, String sourceFile, int maxResult) {
-        this(context, sourceFile, maxResult, null, null);
+        this(context, sourceFile, maxResult, null, null, null);
+    }
+
+    /**
+     * 保留增加元数据过滤前的五参数构造方式。
+     *
+     * @param context 文本或问题
+     * @param sourceFile 来源文件
+     * @param maxResult 最大结果数
+     * @param conversationId 会话 ID
+     * @param includeMemory 是否启用会话记忆
+     */
+    public VectorQuery(
+            String context,
+            String sourceFile,
+            int maxResult,
+            String conversationId,
+            Boolean includeMemory
+    ) {
+        this(context, sourceFile, maxResult, conversationId, includeMemory, null);
     }
 
     /**

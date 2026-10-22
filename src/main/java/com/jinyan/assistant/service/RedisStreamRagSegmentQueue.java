@@ -3,6 +3,7 @@ package com.jinyan.assistant.service;
 import com.jinyan.assistant.config.RagIngestionProperties;
 import com.jinyan.assistant.entity.RagIngestionStatus;
 import com.jinyan.assistant.entity.RagSegmentMessage;
+import com.jinyan.assistant.exception.ApiException;
 import org.redisson.api.AutoClaimResult;
 import org.redisson.api.RAtomicLong;
 import org.redisson.api.RMap;
@@ -15,6 +16,7 @@ import org.redisson.api.stream.StreamReadGroupArgs;
 import org.redisson.client.RedisBusyException;
 import org.redisson.client.codec.StringCodec;
 import org.springframework.stereotype.Service;
+import org.springframework.http.HttpStatus;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -200,7 +202,11 @@ public class RedisStreamRagSegmentQueue {
         RMap<String, String> job = job(fileId);
         String status = job.get("status");
         if (status == null) {
-            throw new IllegalArgumentException("RAG ingestion job not found: " + fileId);
+            throw new ApiException(
+                    HttpStatus.NOT_FOUND,
+                    "INGESTION_JOB_NOT_FOUND",
+                    "文档入库任务不存在: " + fileId
+            );
         }
         return new RagIngestionStatus(
                 fileId,

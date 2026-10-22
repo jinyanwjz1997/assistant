@@ -4,7 +4,9 @@ import com.jinyan.assistant.service.VectorService;
 import com.jinyan.assistant.entity.DocumentChunk;
 import com.jinyan.assistant.entity.DocumentPage;
 import com.jinyan.assistant.entity.FileInfo;
+import com.jinyan.assistant.entity.KnowledgeMetadataFilter;
 import com.jinyan.assistant.entity.RagSegmentMessage;
+import com.jinyan.assistant.exception.ApiException;
 import com.jinyan.assistant.service.DocumentChunker;
 import com.jinyan.assistant.service.FileService;
 import com.jinyan.assistant.service.RedisStreamRagSegmentQueue;
@@ -16,12 +18,15 @@ import dev.langchain4j.store.embedding.EmbeddingMatch;
 import dev.langchain4j.store.embedding.EmbeddingSearchRequest;
 import dev.langchain4j.store.embedding.EmbeddingSearchResult;
 import dev.langchain4j.store.embedding.EmbeddingStore;
+import dev.langchain4j.store.embedding.filter.Filter;
+import dev.langchain4j.store.embedding.filter.MetadataFilterBuilder;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.text.PDFTextStripper;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
+import org.springframework.http.HttpStatus;
 import org.springframework.util.StringUtils;
 
 import java.io.IOException;
@@ -105,6 +110,24 @@ public class VectorServiceImpl implements VectorService {
      */
     @Override
     public List<EmbeddingMatch<TextSegment>> searchRelevantContext(String userQuery, int maxResults) {
+        return searchRelevantContext(userQuery, maxResults, null);
+    }
+
+    /**
+     * 将用户问题向量化，并在向量数据库中同时执行相似度检索和元数据过滤。
+     *
+     * @param userQuery 用户查询文本
+     * @param maxResults 最终期望返回的父章节数量
+     * @param metadataFilter 文件、类型、标题和页码过滤条件，可以为空
+     * @return 按相似度排序且符合元数据条件的候选子片段
+     * @throws IllegalArgumentException 当查询为空或结果数量小于 1 时抛出
+     */
+    @Override
+    public List<EmbeddingMatch<TextSegment>> searchRelevantContext(
+            String userQuery,
+            int maxResults,
+            KnowledgeMetadataFilter metadataFilter
+    ) {
         if (!StringUtils.hasText(userQuery)) {
             throw new IllegalArgumentException("userQuery must not be blank");
         }
@@ -114,13 +137,82 @@ public class VectorServiceImpl implements VectorService {
 
         // 同一父章节可能命中多个子片段，因此多取候选，RAG 回答服务再按 parentSectionId 去重。
         int candidateCount = Math.min(100, Math.max(maxResults, maxResults * 3));
-        EmbeddingSearchRequest searchRequest = EmbeddingSearchRequest.builder()
+        EmbeddingSearchRequest.EmbeddingSearchRequestBuilder requestBuilder =
+                EmbeddingSearchRequest.builder()
                 .queryEmbedding(embeddingModel.embed(userQuery).content())
                 .maxResults(candidateCount)
-                .minScore(0.7)
-                .build();
+                .minScore(0.7);
+        Filter filter = buildMetadataFilter(metadataFilter);
+        if (filter != null) {
+            requestBuilder.filter(filter);
+        }
+        EmbeddingSearchRequest searchRequest = requestBuilder.build();
         EmbeddingSearchResult<TextSegment> result = embeddingStore.search(searchRequest);
         return result.matches();
+    }
+
+    /**
+     * 将接口白名单过滤条件转换为 LangChain4j 过滤表达式。
+     *
+     * <p>不同字段使用 AND 连接，文件 ID 和内容类型列表分别使用 IN 条件。页码按整数
+     * 比较，确保 pgvector 生成正确的 JSON 元数据数值查询。
+     *
+     * @param metadataFilter 接口过滤条件，可以为空
+     * @return LangChain4j 过滤表达式；没有有效条件时返回 {@code null}
+     */
+    private Filter buildMetadataFilter(KnowledgeMetadataFilter metadataFilter) {
+        if (metadataFilter == null || metadataFilter.isEmpty()) {
+            return null;
+        }
+
+        Filter filter = null;
+        if (!metadataFilter.fileIds().isEmpty()) {
+            filter = appendFilter(
+                    filter,
+                    MetadataFilterBuilder.metadataKey("fileId")
+                            .isIn(metadataFilter.fileIds())
+            );
+        }
+        if (!metadataFilter.contentTypes().isEmpty()) {
+            filter = appendFilter(
+                    filter,
+                    MetadataFilterBuilder.metadataKey("contentType")
+                            .isIn(metadataFilter.contentTypes())
+            );
+        }
+        if (metadataFilter.headingPathContains() != null) {
+            filter = appendFilter(
+                    filter,
+                    MetadataFilterBuilder.metadataKey("headingPath")
+                            .containsString(metadataFilter.headingPathContains())
+            );
+        }
+        if (metadataFilter.minPageNumber() != null) {
+            filter = appendFilter(
+                    filter,
+                    MetadataFilterBuilder.metadataKey("pageNumber")
+                            .isGreaterThanOrEqualTo(metadataFilter.minPageNumber())
+            );
+        }
+        if (metadataFilter.maxPageNumber() != null) {
+            filter = appendFilter(
+                    filter,
+                    MetadataFilterBuilder.metadataKey("pageNumber")
+                            .isLessThanOrEqualTo(metadataFilter.maxPageNumber())
+            );
+        }
+        return filter;
+    }
+
+    /**
+     * 使用 AND 将新条件追加到已有过滤表达式。
+     *
+     * @param current 已有表达式，可以为空
+     * @param next 待追加的表达式
+     * @return 合并后的表达式
+     */
+    private Filter appendFilter(Filter current, Filter next) {
+        return current == null ? next : current.and(next);
     }
 
     /**
@@ -135,7 +227,11 @@ public class VectorServiceImpl implements VectorService {
     public String readDocument(String filePath) {
         Path path = Path.of(filePath).toAbsolutePath().normalize();
         if (!Files.isRegularFile(path)) {
-            throw new IllegalArgumentException("File does not exist: " + path);
+            throw new ApiException(
+                    HttpStatus.NOT_FOUND,
+                    "FILE_NOT_FOUND",
+                    "指定的本地文件不存在"
+            );
         }
 
         try (InputStream inputStream = Files.newInputStream(path)) {
@@ -286,8 +382,10 @@ public class VectorServiceImpl implements VectorService {
             }
         }
 
-        throw new IllegalArgumentException(
-                "Unsupported content type: " + normalizedContentType + " for file: " + fileName
+        throw new ApiException(
+                HttpStatus.UNSUPPORTED_MEDIA_TYPE,
+                "UNSUPPORTED_DOCUMENT_TYPE",
+                "不支持该文件类型: " + normalizedContentType
         );
     }
 

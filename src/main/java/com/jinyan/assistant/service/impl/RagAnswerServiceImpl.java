@@ -2,6 +2,7 @@ package com.jinyan.assistant.service.impl;
 
 import com.jinyan.assistant.entity.RagAnswer;
 import com.jinyan.assistant.entity.RagAnswerPreparation;
+import com.jinyan.assistant.entity.KnowledgeMetadataFilter;
 import com.jinyan.assistant.entity.RelevantContext;
 import com.jinyan.assistant.entity.MemoryContext;
 import com.jinyan.assistant.entity.ShortTermMemory;
@@ -119,11 +120,33 @@ public class RagAnswerServiceImpl implements RagAnswerService {
             String conversationId,
             boolean includeMemory
     ) {
+        return answer(question, maxResults, conversationId, includeMemory, null);
+    }
+
+    /**
+     * 基于经过元数据过滤的文档、短期会话记忆和长期向量记忆生成回答。
+     *
+     * @param question 用户问题
+     * @param maxResults 文档召回数量
+     * @param conversationId 会话 ID
+     * @param includeMemory 是否查询和写入记忆
+     * @param metadataFilter 知识库元数据过滤条件，可以为空
+     * @return 带文档证据和长期记忆证据的回答
+     */
+    @Override
+    public RagAnswer answer(
+            String question,
+            int maxResults,
+            String conversationId,
+            boolean includeMemory,
+            KnowledgeMetadataFilter metadataFilter
+    ) {
         RagAnswerPreparation preparation = prepare(
                 question,
                 maxResults,
                 conversationId,
-                includeMemory
+                includeMemory,
+                metadataFilter
         );
         if (preparation.contexts().isEmpty() && preparation.memories().isEmpty()) {
             String fallback = NO_RELEVANT_CONTEXT_ANSWER;
@@ -185,6 +208,27 @@ public class RagAnswerServiceImpl implements RagAnswerService {
             String conversationId,
             boolean includeMemory
     ) {
+        return prepare(question, maxResults, conversationId, includeMemory, null);
+    }
+
+    /**
+     * 准备经过元数据过滤的文档上下文及会话记忆提示词，但不调用模型。
+     *
+     * @param question 用户问题
+     * @param maxResults 文档召回数量
+     * @param conversationId 会话 ID
+     * @param includeMemory 是否查询记忆
+     * @param metadataFilter 知识库元数据过滤条件，可以为空
+     * @return 模型提示词及其证据
+     */
+    @Override
+    public RagAnswerPreparation prepare(
+            String question,
+            int maxResults,
+            String conversationId,
+            boolean includeMemory,
+            KnowledgeMetadataFilter metadataFilter
+    ) {
         if (!StringUtils.hasText(question)) {
             throw new IllegalArgumentException("question must not be blank");
         }
@@ -194,7 +238,7 @@ public class RagAnswerServiceImpl implements RagAnswerService {
 
         int resultLimit = Math.min(maxResults, MAX_CONTEXTS);
         List<RelevantContext> contexts = toRelevantContexts(
-                vectorService.searchRelevantContext(question, resultLimit),
+                vectorService.searchRelevantContext(question, resultLimit, metadataFilter),
                 resultLimit
         );
         String normalizedConversationId = includeMemory

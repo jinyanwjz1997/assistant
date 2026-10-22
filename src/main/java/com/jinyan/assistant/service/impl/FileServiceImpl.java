@@ -2,9 +2,11 @@ package com.jinyan.assistant.service.impl;
 
 import com.jinyan.assistant.entity.FileInfo;
 import com.jinyan.assistant.entity.FileSummary;
+import com.jinyan.assistant.exception.ApiException;
 import com.jinyan.assistant.repository.FileInfoRepository;
 import com.jinyan.assistant.service.FileService;
 import org.springframework.stereotype.Service;
+import org.springframework.http.HttpStatus;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 
@@ -63,7 +65,11 @@ public class FileServiceImpl implements FileService {
             throw new IllegalArgumentException("fileId must not be blank");
         }
         return fileInfoRepository.findById(fileId)
-                .orElseThrow(() -> new IllegalArgumentException("File not found: " + fileId));
+                .orElseThrow(() -> new ApiException(
+                        HttpStatus.NOT_FOUND,
+                        "FILE_NOT_FOUND",
+                        "文件不存在: " + fileId
+                ));
     }
 
     /**

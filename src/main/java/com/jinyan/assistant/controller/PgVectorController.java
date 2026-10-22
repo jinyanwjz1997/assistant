@@ -4,6 +4,7 @@ import com.jinyan.assistant.entity.RagAnswer;
 import com.jinyan.assistant.entity.RagIngestionStatus;
 import com.jinyan.assistant.entity.MemoryContext;
 import com.jinyan.assistant.entity.MemoryQuery;
+import com.jinyan.assistant.entity.KnowledgeMetadataFilter;
 import com.jinyan.assistant.entity.VectorQuery;
 import com.jinyan.assistant.service.ConversationMemoryService;
 import com.jinyan.assistant.service.RagAnswerService;
@@ -65,7 +66,8 @@ public class PgVectorController {
                 vectorQuery.context(),
                 vectorQuery.maxResult(),
                 vectorQuery.conversationId(),
-                vectorQuery.memoryEnabled()
+                vectorQuery.memoryEnabled(),
+                vectorQuery.metadataFilter()
         );
     }
 
@@ -89,6 +91,13 @@ public class PgVectorController {
      *
      * @param question 用户问题
      * @param maxResults 最大召回父章节数量
+     * @param conversationId 会话 ID
+     * @param includeMemory 是否启用会话记忆
+     * @param fileIds 允许召回的文件 ID，可通过重复参数或逗号分隔传递多个值
+     * @param contentTypes 允许召回的 MIME 类型，可传递多个值
+     * @param headingPathContains 标题路径需要包含的文本
+     * @param minPageNumber 最小页码，包含边界
+     * @param maxPageNumber 最大页码，包含边界
      * @return RAG 流式响应发送器
      */
     @GetMapping(value = "/searchRelevantContext/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
@@ -96,13 +105,26 @@ public class PgVectorController {
             @RequestParam String question,
             @RequestParam(defaultValue = "5") int maxResults,
             @RequestParam(required = false) String conversationId,
-            @RequestParam(defaultValue = "true") boolean includeMemory
+            @RequestParam(defaultValue = "true") boolean includeMemory,
+            @RequestParam(required = false) List<String> fileIds,
+            @RequestParam(required = false) List<String> contentTypes,
+            @RequestParam(required = false) String headingPathContains,
+            @RequestParam(required = false) Integer minPageNumber,
+            @RequestParam(required = false) Integer maxPageNumber
     ) {
+        KnowledgeMetadataFilter metadataFilter = new KnowledgeMetadataFilter(
+                fileIds,
+                contentTypes,
+                headingPathContains,
+                minPageNumber,
+                maxPageNumber
+        );
         return ragStreamingAnswerService.streamAnswer(
                 question,
                 maxResults,
                 conversationId,
-                includeMemory
+                includeMemory,
+                metadataFilter
         );
     }
 

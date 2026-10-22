@@ -1,17 +1,21 @@
 package com.jinyan.assistant.service.impl;
 
 import com.jinyan.assistant.entity.RagAnswerPreparation;
+import com.jinyan.assistant.entity.KnowledgeMetadataFilter;
+import com.jinyan.assistant.exception.ApiErrorResponse;
 import com.jinyan.assistant.service.ConversationMemoryService;
 import com.jinyan.assistant.service.DeepSeekService;
 import com.jinyan.assistant.service.RagAnswerService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.MediaType;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.io.IOException;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
@@ -70,6 +74,26 @@ public class RagStreamingAnswerService {
             String conversationId,
             boolean includeMemory
     ) {
+        return streamAnswer(question, maxResults, conversationId, includeMemory, null);
+    }
+
+    /**
+     * 创建经过知识库元数据过滤且带会话记忆的 RAG 流式回答。
+     *
+     * @param question 用户问题
+     * @param maxResults 文档和记忆召回数量上限
+     * @param conversationId 会话 ID
+     * @param includeMemory 是否启用记忆
+     * @param metadataFilter 知识库元数据过滤条件，可以为空
+     * @return SSE 发送器
+     */
+    public SseEmitter streamAnswer(
+            String question,
+            int maxResults,
+            String conversationId,
+            boolean includeMemory,
+            KnowledgeMetadataFilter metadataFilter
+    ) {
         SseEmitter emitter = new SseEmitter(STREAM_TIMEOUT_MILLIS);
         AtomicBoolean closed = new AtomicBoolean(false);
         AtomicBoolean failed = new AtomicBoolean(false);
@@ -81,7 +105,8 @@ public class RagStreamingAnswerService {
                     question,
                     maxResults,
                     conversationId,
-                    includeMemory
+                    includeMemory,
+                    metadataFilter
             );
             sendEvent(
                     emitter,
@@ -219,12 +244,20 @@ public class RagStreamingAnswerService {
         if (!closed.compareAndSet(false, true)) {
             return;
         }
-        log.error("RAG流式回答失败", throwable);
+        String requestId = UUID.randomUUID().toString();
+        log.error("RAG流式回答失败, requestId:{}", requestId, throwable);
         try {
             sendEvent(
                     emitter,
                     "failure",
-                    Map.of("message", "回答生成失败，请稍后重试。"),
+                    ApiErrorResponse.of(
+                            HttpStatus.INTERNAL_SERVER_ERROR.value(),
+                            "RAG_STREAM_ERROR",
+                            "回答生成失败，请稍后重试。",
+                            "/embedding/searchRelevantContext/stream",
+                            requestId,
+                            Map.of()
+                    ),
                     MediaType.APPLICATION_JSON
             );
             emitter.complete();

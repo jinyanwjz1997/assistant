@@ -66,6 +66,12 @@
             <artifactId>spring-boot-starter-data-jpa</artifactId>
         </dependency>
 
+        <!-- Elasticsearch 官方 Java 客户端的 Spring Data 封装。 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-elasticsearch</artifactId>
+        </dependency>
+
         <!-- PostgreSQL 驱动 -->
         <dependency>
             <groupId>org.postgresql</groupId>

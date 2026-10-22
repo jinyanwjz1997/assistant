@@ -3,9 +3,10 @@ spring:
     name: assistant
   datasource:
     driver-class-name: org.postgresql.Driver
-    url: jdbc:postgresql://localhost:5432/interview_jinyan?currentSchema=jinyan
-    username: postgres
-    password: 123456
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/interview_jinyan?currentSchema=jinyan&reWriteBatchedInserts=true}
+    username: ${DB_USERNAME:postgres}
+    # 不提供默认密码，避免源码或构建产物携带数据库凭据。
+    password: ${DB_PASSWORD}
 
     # Hikari 连接池优化配置（可选）
     hikari:
@@ -17,13 +18,24 @@ spring:
 
   data:
     redis:
-      url: redis://127.0.0.1:6379
+      url: ${REDIS_URL:redis://127.0.0.1:6379}
+
+  # Elasticsearch 连接配置。密码只从运行环境读取，不写入源码。
+  elasticsearch:
+    uris: ${ELASTICSEARCH_URIS:http://127.0.0.1:9200}
+    username: ${ELASTICSEARCH_USERNAME:}
+    password: ${ELASTICSEARCH_PASSWORD:}
 
   jpa:
     database-platform: org.hibernate.dialect.PostgreSQLDialect
     hibernate:
       ddl-auto: none # 自动同步实体类到数据库表结构（开发环境推荐，生产环境建议用 none）
     show-sql: true     # 在控制台打印生成的 SQL 语句
+    properties:
+      hibernate:
+        jdbc:
+          batch_size: ${DB_JPA_BATCH_SIZE:100}
+        order_inserts: true
 
 server:
   port: 8080
@@ -32,17 +44,18 @@ server:
 
 langchain:
   deep-seek:
-    apiKey: sk-1361c727d8974364865d0d5eb144884f
-    baseUrl: https://api.deepseek.com
-    modelName: deepseek-v4-pro
-    maxTokens: 100000
+    # API Key 只能通过运行环境注入，不能提交到源码仓库。
+    api-key: ${DEEPSEEK_API_KEY}
+    base-url: ${DEEPSEEK_BASE_URL:https://api.deepseek.com}
+    model-name: ${DEEPSEEK_MODEL_NAME:deepseek-v4-pro}
+    max-tokens: ${DEEPSEEK_MAX_TOKENS:100000}
     # 普通聊天保留客户端内部重试；RAG 摘要由 Redis Stream 统一重试，避免双重重试放大请求量。
     timeout: 120s
     max-retries: 2
     summary-timeout: 120s
     # 摘要使用非推理模型，避免 Token 被 reasoning 内容耗尽后返回空正文。
-    summary-model-name: deepseek-chat
-    summary-max-tokens: 1024
+    summary-model-name: ${DEEPSEEK_SUMMARY_MODEL_NAME:deepseek-chat}
+    summary-max-tokens: ${DEEPSEEK_SUMMARY_MAX_TOKENS:1024}
     summary-max-retries: 0
 logging:
   charset:
@@ -54,12 +67,22 @@ langchain4j:
   # 配置 Ollama Embedding 模型
   ollama:
     embedding-model:
-      base-url: http://localhost:11434 # 本地 Ollama 地址
-      model-name: qwen3-embedding:4b   # 模型名称
+      base-url: ${OLLAMA_BASE_URL:http://localhost:11434} # 本地 Ollama 地址
+      model-name: ${OLLAMA_EMBEDDING_MODEL:qwen3-embedding:4b} # 模型名称
       timeout: 60s
   rag:
 
 assistant:
+  elasticsearch:
+    # 文档索引名称，首次写入或调用初始化接口时创建。
+    index-name: ${ELASTICSEARCH_INDEX_NAME:assistant_documents}
+  database:
+    batch-write:
+      # 并行度应低于 Hikari maximum-pool-size，为普通查询和后台消费者预留连接。
+      parallelism: ${DB_BATCH_PARALLELISM:4}
+      batch-size: ${DB_BATCH_SIZE:100}
+      queue-capacity: ${DB_BATCH_QUEUE_CAPACITY:100}
+      max-records: ${DB_BATCH_MAX_RECORDS:10000}
   memory:
     # 短期窗口按消息条数滑动，用户消息和助手消息分别计数。
     short-term-max-messages: 10

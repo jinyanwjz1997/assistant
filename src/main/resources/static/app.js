@@ -43,7 +43,9 @@ document.addEventListener("DOMContentLoaded", () => {
 async function loadFiles() {
     try {
         const response = await fetch(`${API_BASE}/files`);
-        if (!response.ok) throw new Error(`文件列表加载失败 (${response.status})`);
+        if (!response.ok) {
+            throw new Error(await responseErrorMessage(response, `文件列表加载失败 (${response.status})`));
+        }
         state.files = await response.json();
         $("#library-updated").textContent = `刚刚同步 · ${formatTime(new Date())}`;
         $("#file-count").textContent = state.files.length;
@@ -101,7 +103,9 @@ async function uploadFile(file) {
         const body = new FormData();
         body.append("file", file);
         const response = await fetch(`${API_BASE}/embedding/uploadDocument`, { method: "POST", body });
-        if (!response.ok) throw new Error(await response.text() || `上传失败 (${response.status})`);
+        if (!response.ok) {
+            throw new Error(await responseErrorMessage(response, `上传失败 (${response.status})`));
+        }
         const fileId = await response.text();
         progress.style.width = "100%";
         status.textContent = "已入队";
@@ -121,7 +125,9 @@ async function selectFile(fileId, fetchDetail = true) {
     if (!fetchDetail) return;
     try {
         const response = await fetch(`${API_BASE}/files/${encodeURIComponent(fileId)}`);
-        if (!response.ok) throw new Error("文档详情加载失败");
+        if (!response.ok) {
+            throw new Error(await responseErrorMessage(response, "文档详情加载失败"));
+        }
         const file = await response.json();
         renderDetail(file);
         refreshStatus(fileId, true);
@@ -195,7 +201,9 @@ async function submitQuestion(event) {
         });
         const url = `${API_BASE}/embedding/searchRelevantContext/stream?${params}`;
         const response = await fetch(url, { headers: { Accept: "text/event-stream" } });
-        if (!response.ok || !response.body) throw new Error("问答连接失败");
+        if (!response.ok || !response.body) {
+            throw new Error(await responseErrorMessage(response, "问答连接失败"));
+        }
         state.activeStream = response.body.getReader();
         await readSseStream(state.activeStream, answer);
     } catch (error) {
@@ -335,6 +343,18 @@ function parseSseData(data) {
         return typeof value === "string" ? value : value.content || value.message || "";
     } catch (_) {
         return data;
+    }
+}
+async function responseErrorMessage(response, fallback) {
+    try {
+        const contentType = response.headers.get("content-type") || "";
+        if (contentType.includes("application/json")) {
+            const payload = await response.json();
+            return payload.message || fallback;
+        }
+        return (await response.text()).trim() || fallback;
+    } catch (_) {
+        return fallback;
     }
 }
 function normalizeGenericCitations(text, sourceNumbers) {
